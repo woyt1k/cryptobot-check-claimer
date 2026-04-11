@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
@@ -12,6 +13,29 @@ from telethon.errors import FloodWaitError, UserIsBlockedError
 from telethon.tl.functions.messages import StartBotRequest
 from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 
+
+def load_local_env(path: str = ".env") -> None:
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+load_local_env()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
