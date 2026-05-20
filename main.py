@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -51,6 +52,7 @@ CHECK_PREFIXES = tuple(
     if item.strip()
 )
 CLAIM_WORKERS = max(1, int(os.getenv("CLAIM_WORKERS", "3")))
+CLAIM_MAX_AGE_SEC = max(0.0, float(os.getenv("CLAIM_MAX_AGE_SEC", "20")))
 SEEN_TTL_SEC = max(60, int(os.getenv("SEEN_TTL_SEC", "21600")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_CHAT = os.getenv("LOG_CHAT", "").strip()
@@ -62,7 +64,6 @@ TG_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 START_RE = re.compile(r"(?:^|\s)/start(?:@[A-Za-z0-9_]{3,})?\s+(?P<payload>[A-Za-z0-9_-]{4,})", re.IGNORECASE)
-RAW_PAYLOAD_RE = re.compile(r"(?<![A-Za-z0-9_])(?P<payload>[A-Za-z0-9_-]{6,})(?![A-Za-z0-9_])")
 TG_HOSTS = {"t.me", "telegram.me", "telegram.dog"}
 FEEDBACK_RULES = [
     ("captcha", "captcha required", ("captcha", "капч", "prove you are human", "verify you are human")),
@@ -76,7 +77,37 @@ FEEDBACK_RULES = [
     ("success", "activated", ("deposited to your balance", "instantly deposited", "you received", "credited", "зачислен", "получили")),
 ]
 
-claim_queue: "asyncio.Queue[Tuple[str, str]]" = asyncio.Queue()
+
+def build_raw_payload_re(prefixes: Tuple[str, ...]) -> re.Pattern:
+    alternatives = []
+    for prefix in prefixes:
+        suffix_min_len = max(0, 6 - len(prefix))
+        alternatives.append(rf"{re.escape(prefix)}[A-Za-z0-9_-]{{{suffix_min_len},}}")
+
+    if not alternatives:
+        return re.compile(r"a^")
+
+    return re.compile(
+        rf"(?<![A-Za-z0-9_])(?P<payload>(?:{'|'.join(alternatives)}))(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    )
+
+
+RAW_PAYLOAD_RE = build_raw_payload_re(CHECK_PREFIXES)
+
+
+@dataclass
+class ClaimItem:
+    bot: str
+    payload: str
+    chat_id: int
+    message_id: int
+    found_at: float
+    queued_at: float
+    attempts: int = 1
+
+
+claim_queue: "asyncio.Queue[ClaimItem]" = asyncio.Queue()
 log_queue: "asyncio.Queue[str]" = asyncio.Queue(maxsize=2000)
 seen: Dict[str, float] = {}
 seen_lock = asyncio.Lock()
@@ -352,7 +383,7 @@ async def process_bot_feedback(message, bot_name: str) -> None:
     await enqueue_log(line)
 
 
-async def mark_and_queue(bot: str, payload: str, chat_id: int, message_id: int) -> None:
+async def mark_and_queue(bot: str, payload: str, chat_id: int, message_id: int, found_at: float) -> None:
     now = time.monotonic()
     key = f"{bot}:{payload}"
     async with seen_lock:
@@ -366,30 +397,75 @@ async def mark_and_queue(bot: str, payload: str, chat_id: int, message_id: int) 
             for item in stale:
                 seen.pop(item, None)
 
-    await claim_queue.put((bot, payload))
-    logging.info("Queued %s from chat=%s msg=%s", key, chat_id, message_id)
+    queued_at = time.perf_counter()
+    await claim_queue.put(
+        ClaimItem(
+            bot=bot,
+            payload=payload,
+            chat_id=chat_id,
+            message_id=message_id,
+            found_at=found_at,
+            queued_at=queued_at,
+        )
+    )
+    found_ms = int((queued_at - found_at) * 1000)
+    logging.info(
+        "Queued %s from chat=%s msg=%s found_to_queue=%sms qsize=%s",
+        key,
+        chat_id,
+        message_id,
+        found_ms,
+        claim_queue.qsize(),
+    )
     if LOG_QUEUE_EVENTS:
-        await enqueue_log(f"[QUEUE] {bot}:{mask_payload(payload)} chat={chat_id} msg={message_id}")
+        await enqueue_log(
+            f"[QUEUE] {bot}:{mask_payload(payload)} chat={chat_id} msg={message_id} "
+            f"found_to_queue={found_ms}ms qsize={claim_queue.qsize()}"
+        )
 
 
 async def process_message(message, allowed_bots: Set[str]) -> None:
-    matches: Set[Tuple[str, str]] = set()
+    matches: Dict[Tuple[str, str], float] = {}
     for fragment in iter_message_fragments(message):
         for pair in extract_matches(fragment, allowed_bots):
-            matches.add(pair)
+            matches.setdefault(pair, time.perf_counter())
 
     if not matches:
         return
 
-    for bot, payload in matches:
-        await mark_and_queue(bot, payload, message.chat_id, message.id)
+    for (bot, payload), found_at in matches.items():
+        await mark_and_queue(bot, payload, message.chat_id, message.id, found_at)
 
 
 async def claim_worker(worker_id: int, bot_peers) -> None:
     while True:
-        bot, payload = await claim_queue.get()
+        item = await claim_queue.get()
+        bot = item.bot
+        payload = item.payload
         peer = bot_peers.get(bot)
         try:
+            now = time.perf_counter()
+            age_ms = int((now - item.found_at) * 1000)
+            queue_ms = int((now - item.queued_at) * 1000)
+            if CLAIM_MAX_AGE_SEC and (now - item.found_at) > CLAIM_MAX_AGE_SEC:
+                logging.info(
+                    "Worker-%s drop stale %s:%s age=%sms queue=%sms attempts=%s chat=%s msg=%s",
+                    worker_id,
+                    bot,
+                    payload,
+                    age_ms,
+                    queue_ms,
+                    item.attempts,
+                    item.chat_id,
+                    item.message_id,
+                )
+                if LOG_RESULT_EVENTS:
+                    await enqueue_log(
+                        f"[DROP] {bot}:{mask_payload(payload)} age={age_ms}ms "
+                        f"queue={queue_ms}ms worker={worker_id}"
+                    )
+                continue
+
             if peer is None:
                 logging.warning("Unknown bot peer: %s", bot)
                 continue
@@ -404,10 +480,24 @@ async def claim_worker(worker_id: int, bot_peers) -> None:
                     random_id=random.randint(1, 2**63 - 1),
                 )
             )
-            elapsed_ms = int((time.perf_counter() - started) * 1000)
-            logging.info("Worker-%s sent start for %s:%s in %sms", worker_id, bot, payload, elapsed_ms)
+            finished = time.perf_counter()
+            elapsed_ms = int((finished - started) * 1000)
+            total_ms = int((finished - item.found_at) * 1000)
+            logging.info(
+                "Worker-%s sent start for %s:%s request=%sms queue=%sms total=%sms attempts=%s",
+                worker_id,
+                bot,
+                payload,
+                elapsed_ms,
+                queue_ms,
+                total_ms,
+                item.attempts,
+            )
             if LOG_RESULT_EVENTS:
-                await enqueue_log(f"[SENT] {bot}:{mask_payload(payload)} worker={worker_id} {elapsed_ms}ms")
+                await enqueue_log(
+                    f"[SENT] {bot}:{mask_payload(payload)} worker={worker_id} "
+                    f"request={elapsed_ms}ms queue={queue_ms}ms total={total_ms}ms"
+                )
 
             # Some bot replies arrive in StartBotRequest updates immediately.
             for text in extract_feedback_texts(result):
@@ -423,18 +513,33 @@ async def claim_worker(worker_id: int, bot_peers) -> None:
                 await enqueue_log(line)
                 break
         except FloodWaitError as e:
+            retry_age_ms = int((time.perf_counter() - item.found_at) * 1000)
             logging.warning(
-                "Worker-%s flood wait %ss on %s:%s. Requeue.",
+                "Worker-%s flood wait %ss on %s:%s age=%sms attempts=%s. Requeue.",
                 worker_id,
                 e.seconds,
                 bot,
                 payload,
+                retry_age_ms,
+                item.attempts,
             )
             await enqueue_log(
-                f"[REQUEUE] {bot}:{mask_payload(payload)} flood_wait={e.seconds}s worker={worker_id}"
+                f"[REQUEUE] {bot}:{mask_payload(payload)} flood_wait={e.seconds}s "
+                f"age={retry_age_ms}ms worker={worker_id}"
             )
             await asyncio.sleep(e.seconds + 0.2)
-            await claim_queue.put((bot, payload))
+            requeue_at = time.perf_counter()
+            if not CLAIM_MAX_AGE_SEC or (requeue_at - item.found_at) <= CLAIM_MAX_AGE_SEC:
+                await claim_queue.put(replace(item, queued_at=requeue_at, attempts=item.attempts + 1))
+            else:
+                logging.info(
+                    "Worker-%s drop stale after flood wait %s:%s age=%sms attempts=%s",
+                    worker_id,
+                    bot,
+                    payload,
+                    int((requeue_at - item.found_at) * 1000),
+                    item.attempts,
+                )
         except UserIsBlockedError:
             logging.error("Unblock @%s and restart script.", bot)
             await enqueue_log(f"[ERROR] @{bot} is blocked. Unblock bot to continue.")
@@ -481,14 +586,17 @@ async def run() -> None:
             raise SystemExit(f"Cannot resolve LOG_CHAT={LOG_CHAT!r}: {e}") from e
 
     logging.info(
-        "Watching all incoming chats. Targets: %s | check prefixes: %s",
+        "Watching all incoming chats. Targets: %s | check prefixes: %s | workers=%s | max_age=%ss",
         ", ".join(sorted(allowed_bots)),
         ", ".join(CHECK_PREFIXES),
+        CLAIM_WORKERS,
+        CLAIM_MAX_AGE_SEC,
     )
     if LOG_CHAT:
         await enqueue_log(
             "[START] fast_check_claimer online | "
-            f"targets={','.join(sorted(allowed_bots))} prefixes={','.join(CHECK_PREFIXES)}"
+            f"targets={','.join(sorted(allowed_bots))} prefixes={','.join(CHECK_PREFIXES)} "
+            f"workers={CLAIM_WORKERS} max_age={CLAIM_MAX_AGE_SEC}s"
         )
 
     @client.on(events.NewMessage(incoming=True))
