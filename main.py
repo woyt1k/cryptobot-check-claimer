@@ -10,9 +10,9 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, UserIsBlockedError
-from telethon.tl.functions.messages import StartBotRequest
-from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
+from telethon.errors import BotResponseTimeoutError, FloodWaitError, UserIsBlockedError
+from telethon.tl.functions.messages import GetBotCallbackAnswerRequest, StartBotRequest
+from telethon.tl.types import KeyboardButtonCallback, MessageEntityTextUrl, MessageEntityUrl
 
 
 def load_local_env(path: str = ".env") -> None:
@@ -51,13 +51,23 @@ CHECK_PREFIXES = tuple(
     for item in os.getenv("CHECK_PREFIXES", "CQ").split(",")
     if item.strip()
 )
-CLAIM_WORKERS = max(1, int(os.getenv("CLAIM_WORKERS", "3")))
+CLAIM_WORKERS = max(1, int(os.getenv("CLAIM_WORKERS", "1")))
 CLAIM_MAX_AGE_SEC = max(0.0, float(os.getenv("CLAIM_MAX_AGE_SEC", "20")))
 SEEN_TTL_SEC = max(60, int(os.getenv("SEEN_TTL_SEC", "21600")))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_CHAT = os.getenv("LOG_CHAT", "").strip()
 LOG_QUEUE_EVENTS = os.getenv("LOG_QUEUE_EVENTS", "0").strip().lower() in {"1", "true", "yes", "on"}
 LOG_RESULT_EVENTS = os.getenv("LOG_RESULT_EVENTS", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+CLAIM_BUTTON_LABELS = (
+    "получить",
+    "забрать",
+    "активировать",
+    "receive",
+    "claim",
+    "redeem",
+    "activate",
+)
 
 TG_LINK_RE = re.compile(
     r"(?:(?:https?://)?(?:t(?:elegram)?\.me|telegram\.dog)/[^\s<>()\[\]{}]+|tg://resolve\?[^\s<>()\[\]{}]+)",
@@ -113,16 +123,12 @@ seen: Dict[str, float] = {}
 seen_lock = asyncio.Lock()
 feedback_seen: Dict[str, float] = {}
 feedback_seen_lock = asyncio.Lock()
+callback_seen: Dict[str, float] = {}
+callback_seen_lock = asyncio.Lock()
 recent_attempts: Dict[str, List[Tuple[str, float]]] = {}
 recent_attempts_lock = asyncio.Lock()
 log_peer = None
-
-client = TelegramClient(
-    SESSION_NAME,
-    API_ID,
-    API_HASH,
-    sequential_updates=False,
-)
+client: Optional[TelegramClient] = None
 
 
 def validate_config() -> None:
@@ -160,31 +166,42 @@ def classify_feedback(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def extract_feedback_texts(result) -> List[str]:
-    texts: List[str] = []
-    seen_local: Set[str] = set()
+def extract_result_messages(result) -> List[object]:
+    messages: List[object] = []
+    seen_local: Set[Tuple[Optional[int], int]] = set()
 
-    def add(candidate: Optional[str]) -> None:
-        if not candidate:
+    def add(message) -> None:
+        if message is None:
             return
-        cleaned = candidate.strip()
-        if not cleaned or cleaned in seen_local:
+        message_id = getattr(message, "id", None)
+        key = (message_id, id(message))
+        if key in seen_local:
             return
-        seen_local.add(cleaned)
-        texts.append(cleaned)
+        seen_local.add(key)
+        messages.append(message)
 
     updates = getattr(result, "updates", None) or []
     for update in updates:
-        message = getattr(update, "message", None)
-        if message is None:
-            continue
-        add(getattr(message, "message", None))
-        add(getattr(message, "raw_text", None))
+        add(getattr(update, "message", None))
 
-    messages = getattr(result, "messages", None) or []
-    for message in messages:
-        add(getattr(message, "message", None))
-        add(getattr(message, "raw_text", None))
+    for message in getattr(result, "messages", None) or []:
+        add(message)
+
+    return messages
+
+
+def extract_feedback_texts(result) -> List[str]:
+    texts: List[str] = []
+    seen_local: Set[str] = set()
+    for message in extract_result_messages(result):
+        for candidate in (getattr(message, "message", None), getattr(message, "raw_text", None)):
+            if not candidate:
+                continue
+            cleaned = candidate.strip()
+            if not cleaned or cleaned in seen_local:
+                continue
+            seen_local.add(cleaned)
+            texts.append(cleaned)
 
     return texts
 
@@ -249,6 +266,101 @@ async def should_log_key(key: str) -> bool:
             for item in stale:
                 feedback_seen.pop(item, None)
     return True
+
+
+def is_claim_button_label(text: str) -> bool:
+    normalized = " ".join((text or "").casefold().split()).strip()
+    if not normalized:
+        return False
+    for label in CLAIM_BUTTON_LABELS:
+        pattern = rf"(?:^|\s){re.escape(label)}(?:$|\s|[…,.!?:;\-])"
+        if re.search(pattern, normalized):
+            return True
+    return False
+
+
+def extract_claim_callbacks(message) -> List[Tuple[str, bytes]]:
+    callbacks: List[Tuple[str, bytes]] = []
+    markup = getattr(message, "reply_markup", None)
+    for row in getattr(markup, "rows", None) or []:
+        for button in getattr(row, "buttons", None) or []:
+            if isinstance(button, KeyboardButtonCallback) and is_claim_button_label(button.text):
+                callbacks.append((button.text, button.data))
+    return callbacks
+
+
+async def mark_callback_once(key: str) -> bool:
+    now = time.monotonic()
+    async with callback_seen_lock:
+        ts = callback_seen.get(key)
+        if ts is not None and (now - ts) < SEEN_TTL_SEC:
+            return False
+        callback_seen[key] = now
+        if len(callback_seen) > 20_000:
+            cutoff = now - SEEN_TTL_SEC
+            stale = [item for item, created in callback_seen.items() if created < cutoff]
+            for item in stale:
+                callback_seen.pop(item, None)
+    return True
+
+
+async def release_callback(key: str) -> None:
+    async with callback_seen_lock:
+        callback_seen.pop(key, None)
+
+
+async def click_claim_button(message, bot: str, peer, payload: Optional[str] = None) -> bool:
+    callbacks = extract_claim_callbacks(message)
+    if not callbacks:
+        return False
+
+    if payload is None:
+        payload = await latest_attempt(bot, max_age_sec=45)
+    if payload is None:
+        return False
+
+    message_id = getattr(message, "id", None)
+    if message_id is None:
+        return False
+
+    button_text, button_data = callbacks[0]
+    key = f"{bot}:{message_id}:{button_data.hex()}"
+    if not await mark_callback_once(key):
+        return False
+
+    try:
+        answer = await client(
+            GetBotCallbackAnswerRequest(
+                peer=peer,
+                msg_id=message_id,
+                data=button_data,
+            )
+        )
+        logging.info(
+            "Clicked claim button %r for %s:%s msg=%s",
+            button_text,
+            bot,
+            payload,
+            message_id,
+        )
+        answer_text = getattr(answer, "message", None)
+        if answer_text:
+            verdict = classify_feedback(answer_text)
+            label = verdict[1] if verdict else "callback response"
+            line = f"[CALLBACK] {bot}:{mask_payload(payload)} {label} | {compact_text(answer_text)}"
+            logging.info(line)
+            await enqueue_log(line)
+        return True
+    except BotResponseTimeoutError:
+        # Telegram clients treat this as a completed click: the bot may still edit
+        # the card or send the result as a separate update.
+        logging.info("Claim callback timed out for %s:%s msg=%s", bot, payload, message_id)
+        return True
+    except Exception:
+        await release_callback(key)
+        logging.exception("Failed to click claim button for %s:%s msg=%s", bot, payload, message_id)
+        await enqueue_log(f"[ERROR] callback failed for {bot}:{mask_payload(payload)}")
+        return False
 
 
 def is_check_payload(payload: str) -> bool:
@@ -319,6 +431,7 @@ def extract_matches(fragment: str, allowed_bots: Set[str]) -> List[Tuple[str, st
 
     found: List[Tuple[str, str]] = []
     seen_local: Set[Tuple[str, str]] = set()
+    explicit_payloads: Set[str] = set()
     default_bot = choose_default_bot(allowed_bots)
 
     for match in TG_LINK_RE.finditer(fragment):
@@ -327,6 +440,7 @@ def extract_matches(fragment: str, allowed_bots: Set[str]) -> List[Tuple[str, st
             if pair not in seen_local:
                 found.append(pair)
                 seen_local.add(pair)
+                explicit_payloads.add(pair[1])
 
     for match in START_RE.finditer(fragment):
         payload = match.group("payload")
@@ -334,9 +448,12 @@ def extract_matches(fragment: str, allowed_bots: Set[str]) -> List[Tuple[str, st
         if is_check_payload(payload) and pair not in seen_local:
             found.append(pair)
             seen_local.add(pair)
+            explicit_payloads.add(payload)
 
     for match in RAW_PAYLOAD_RE.finditer(fragment):
         payload = match.group("payload")
+        if payload in explicit_payloads:
+            continue
         pair = (default_bot, payload)
         if is_check_payload(payload) and pair not in seen_local:
             found.append(pair)
@@ -398,7 +515,7 @@ async def mark_and_queue(bot: str, payload: str, chat_id: int, message_id: int, 
                 seen.pop(item, None)
 
     queued_at = time.perf_counter()
-    await claim_queue.put(
+    claim_queue.put_nowait(
         ClaimItem(
             bot=bot,
             payload=payload,
@@ -408,6 +525,8 @@ async def mark_and_queue(bot: str, payload: str, chat_id: int, message_id: int, 
             queued_at=queued_at,
         )
     )
+    # Let the waiting worker send StartBotRequest before synchronous logging.
+    await asyncio.sleep(0)
     found_ms = int((queued_at - found_at) * 1000)
     logging.info(
         "Queued %s from chat=%s msg=%s found_to_queue=%sms qsize=%s",
@@ -424,11 +543,13 @@ async def mark_and_queue(bot: str, payload: str, chat_id: int, message_id: int, 
         )
 
 
-async def process_message(message, allowed_bots: Set[str]) -> None:
+async def process_message(message, bot_aliases: Dict[str, str]) -> None:
+    allowed_bots = set(bot_aliases)
     matches: Dict[Tuple[str, str], float] = {}
     for fragment in iter_message_fragments(message):
-        for pair in extract_matches(fragment, allowed_bots):
-            matches.setdefault(pair, time.perf_counter())
+        for bot, payload in extract_matches(fragment, allowed_bots):
+            canonical_bot = bot_aliases[bot]
+            matches.setdefault((canonical_bot, payload), time.perf_counter())
 
     if not matches:
         return
@@ -499,6 +620,12 @@ async def claim_worker(worker_id: int, bot_peers) -> None:
                     f"request={elapsed_ms}ms queue={queue_ms}ms total={total_ms}ms"
                 )
 
+            # A deep link only starts the bot. Crypto Bot may return a check card
+            # whose callback button performs the actual claim.
+            for response_message in extract_result_messages(result):
+                if await click_claim_button(response_message, bot, peer, payload):
+                    break
+
             # Some bot replies arrive in StartBotRequest updates immediately.
             for text in extract_feedback_texts(result):
                 verdict = classify_feedback(text)
@@ -551,7 +678,7 @@ async def claim_worker(worker_id: int, bot_peers) -> None:
 
 
 async def run() -> None:
-    global log_peer
+    global client, log_peer
 
     validate_config()
     logging.basicConfig(
@@ -559,24 +686,44 @@ async def run() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
+    client = TelegramClient(
+        SESSION_NAME,
+        API_ID,
+        API_HASH,
+        sequential_updates=False,
+    )
     await client.start()
     me = await client.get_me()
     logging.info("Authorized as id=%s username=@%s", me.id, me.username)
 
-    allowed_bots = set(BOT_USERNAMES)
-    bot_peers = {}
-    bot_names_by_id: Dict[int, str] = {}
-    for bot in sorted(allowed_bots):
+    resolved_bots: Dict[int, List[Tuple[str, object]]] = {}
+    for alias in sorted(set(BOT_USERNAMES)):
         try:
-            entity = await client.get_entity(bot)
-            bot_peers[bot] = await client.get_input_entity(entity)
-            bot_names_by_id[int(entity.id)] = bot
+            entity = await client.get_entity(alias)
+            peer = await client.get_input_entity(entity)
+            resolved_bots.setdefault(int(entity.id), []).append((alias, peer))
         except Exception:
-            logging.exception("Failed to resolve bot @%s. Skip.", bot)
-    if not bot_peers:
+            logging.exception("Failed to resolve bot @%s. Skip.", alias)
+    if not resolved_bots:
         raise SystemExit("No bot peers resolved. Check BOT_USERNAMES and access to bot.")
 
-    allowed_bots = set(bot_peers)
+    bot_aliases: Dict[str, str] = {}
+    bot_peers: Dict[str, object] = {}
+    bot_names_by_id: Dict[int, str] = {}
+    for entity_id, aliases_and_peers in resolved_bots.items():
+        aliases = {alias for alias, _peer in aliases_and_peers}
+        canonical_bot = choose_default_bot(aliases)
+        bot_peers[canonical_bot] = aliases_and_peers[0][1]
+        bot_names_by_id[entity_id] = canonical_bot
+        for alias in aliases:
+            bot_aliases[alias] = canonical_bot
+        if len(aliases) > 1:
+            logging.info(
+                "Bot aliases %s resolve to the same peer id=%s; canonical=@%s",
+                ", ".join(f"@{alias}" for alias in sorted(aliases)),
+                entity_id,
+                canonical_bot,
+            )
 
     if LOG_CHAT:
         try:
@@ -587,7 +734,7 @@ async def run() -> None:
 
     logging.info(
         "Watching all incoming chats. Targets: %s | check prefixes: %s | workers=%s | max_age=%ss",
-        ", ".join(sorted(allowed_bots)),
+        ", ".join(sorted(bot_aliases)),
         ", ".join(CHECK_PREFIXES),
         CLAIM_WORKERS,
         CLAIM_MAX_AGE_SEC,
@@ -595,7 +742,7 @@ async def run() -> None:
     if LOG_CHAT:
         await enqueue_log(
             "[START] fast_check_claimer online | "
-            f"targets={','.join(sorted(allowed_bots))} prefixes={','.join(CHECK_PREFIXES)} "
+            f"targets={','.join(sorted(bot_aliases))} prefixes={','.join(CHECK_PREFIXES)} "
             f"workers={CLAIM_WORKERS} max_age={CLAIM_MAX_AGE_SEC}s"
         )
 
@@ -604,16 +751,18 @@ async def run() -> None:
         sender_id = getattr(event.message, "sender_id", None)
         bot_name = bot_names_by_id.get(int(sender_id)) if sender_id is not None else None
         if bot_name is not None:
+            await click_claim_button(event.message, bot_name, bot_peers[bot_name])
             await process_bot_feedback(event.message, bot_name)
-        await process_message(event.message, allowed_bots)
+        await process_message(event.message, bot_aliases)
 
     @client.on(events.MessageEdited(incoming=True))
     async def handle_edited(event):
         sender_id = getattr(event.message, "sender_id", None)
         bot_name = bot_names_by_id.get(int(sender_id)) if sender_id is not None else None
         if bot_name is not None:
+            await click_claim_button(event.message, bot_name, bot_peers[bot_name])
             await process_bot_feedback(event.message, bot_name)
-        await process_message(event.message, allowed_bots)
+        await process_message(event.message, bot_aliases)
 
     workers = [
         asyncio.create_task(claim_worker(worker_id=i + 1, bot_peers=bot_peers))
